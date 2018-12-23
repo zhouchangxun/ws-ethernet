@@ -7,8 +7,8 @@ import traceback
 from select import poll
 from select import POLLIN, POLLOUT, POLLHUP, POLLERR, POLLNVAL
 
-from pytun import TunTapDevice, IFF_TAP, IFF_NO_PI
-
+#from pytun import TunTapDevice, IFF_TAP, IFF_NO_PI
+from tun import TAP , IFF_TAP, IFF_NO_PI
 
 from limiter import RateLimitingState
 
@@ -43,7 +43,8 @@ class TunThread(threading.Thread):
     def __init__(self, *args, **kwargs):
         super(TunThread, self).__init__(*args, **kwargs)
         self.running = True
-        self.tun = TunTapDevice(name="tap0", flags= (IFF_TAP | IFF_NO_PI))
+        #self.tun = TunTapDevice(name="tap0", flags= (IFF_TAP | IFF_NO_PI))
+        self.tun = TAP(name='tap0', flags=(IFF_TAP | IFF_NO_PI))
         self.tun.addr = '10.5.0.1'
         self.tun.netmask = '255.255.0.0'
         self.tun.mtu = 1500
@@ -63,6 +64,7 @@ class TunThread(threading.Thread):
                     if f == self.tun.fileno() and (e & POLLIN):
                         buf = self.tun.read(self.tun.mtu+18) #MTU doesn't include header or CRC32
                         if len(buf):
+                            logger.info('recv data from tap, len%s:' % len(buf))
                             mac = buf[0:6]
                             if mac == BROADCAST or (ord(mac[0]) & 0x1) == 1:
                                 for socket in macmap.values():
@@ -82,8 +84,9 @@ class TunThread(threading.Thread):
                                         pass
 
                                 loop.add_callback(send_message)
-        except:
-            logger.error('closing due to tun error')
+        except Exception:
+            tb = traceback.format_exc()
+            logger.error('tun thread: error. Closing\n%s' % tb)
         finally:
             self.tun.close()
 
@@ -92,7 +95,7 @@ class MainHandler(websocket.WebSocketHandler):
     def __init__(self, *args, **kwargs):
         super(MainHandler, self).__init__(*args,**kwargs)
         self.remote_ip = self.request.headers.get('X-Forwarded-For', self.request.remote_ip)
-        logger.info('%s: connected.' % self.remote_ip)
+        logger.info('new user port[%s]: connected to switch device.' % self.remote_ip)
         self.thread = None
         self.mac = ''
         self.allowance = RATE #unit: messages
@@ -121,6 +124,10 @@ class MainHandler(websocket.WebSocketHandler):
 
     def on_message(self, message):
         #TODO: log IP headers in the future
+        dst_mac = ':'.join('{0:02x}'.format(ord(a)) for a in message[0:6]) 
+        src_mac = ':'.join('{0:02x}'.format(ord(a)) for a in message[6:12]) 
+        logger.info('recv packat from client:src mac:%s, dest mac:%s' % (src_mac,dst_mac))
+        #print("data:", message)
 
         #Logs which user is tied to which MAC so that we detect which user is acting maliciously
         if self.mac != message[6:12]:
@@ -129,28 +136,35 @@ class MainHandler(websocket.WebSocketHandler):
 
             self.mac = message[6:12]
             formatted_mac = ':'.join('{0:02x}'.format(ord(a)) for a in message[6:12]) 
-            logger.info('%s: using mac %s' % (self.remote_ip, formatted_mac))
-
+            logger.info('user[%s]: update mac %s' % (self.remote_ip, formatted_mac))
+            # update mac forward table
             macmap[self.mac] = self
 
         dest = message[0:6]
         try:
             if dest == BROADCAST or (ord(dest[0]) & 0x1) == 1:
+                print('broadcast or multicast frame recvd')
                 if self.upstream.do_throttle(message):
+                    print("broadcast to all port:", macmap.keys())
                     for socket in macmap.values():
                         try:
                                 socket.write_message(str(message),binary=True)
-                        except:
+                        except Exception:
+                            print('write broad packat except:',e)
                             pass
 
+                    print("broadcast to tap0")
                     tunthread.write(message)
             elif macmap.get(dest, False):
+                print('found dst client')
                 if self.upstream.do_throttle(message):
                     try:
                         macmap[dest].write_message(str(message),binary=True)
                     except:
+                        print('write err')
                         pass
             else:
+                print('no found dst mac, default forward to tap0')
                 if self.upstream.do_throttle(message):
                     tunthread.write(message)
 
